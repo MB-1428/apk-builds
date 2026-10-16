@@ -1,0 +1,130 @@
+name: build-apk
+run-name: APK ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: Project zip path
+        required: true
+        type: string
+      variant:
+        description: debug or release
+        required: false
+        default: debug
+        type: string
+      jdk:
+        description: JDK version
+        required: false
+        default: '17'
+        type: string
+      ndk:
+        description: NDK version (optional)
+        required: false
+        default: ''
+        type: string
+      module:
+        description: Gradle module (optional)
+        required: false
+        default: ''
+        type: string
+      tag:
+        description: Release tag
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ZIP_PATH: ${{ inputs.zip_path }}
+      VARIANT: ${{ inputs.variant }}
+      NDK_VER: ${{ inputs.ndk }}
+      MODULE: ${{ inputs.module }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.jdk }}
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Unpack project
+        run: |
+          set -e
+          mkdir -p work
+          unzip -q "$ZIP_PATH" -d work
+          SETTINGS=$(find work -maxdepth 5 -name 'settings.gradle*' | awk '{print length($0) " " $0}' | sort -n | head -n1 | cut -d' ' -f2-)
+          if [ -z "$SETTINGS" ]; then
+            echo "settings.gradle(.kts) not found. Make sure the zip is a complete Gradle project."
+            exit 1
+          fi
+          ROOT=$(dirname "$SETTINGS")
+          echo "Project root: $ROOT"
+          echo "ROOT=$PWD/$ROOT" >> "$GITHUB_ENV"
+          rm -f "$ROOT/local.properties"
+
+      - name: Install requested NDK
+        if: ${{ inputs.ndk != '' }}
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "ndk;$NDK_VER"
+
+      - name: Build with Gradle
+        run: |
+          set -e
+          cd "$ROOT"
+          V="$(echo "${VARIANT:0:1}" | tr '[:lower:]' '[:upper:]')${VARIANT:1}"
+          if [ -n "$MODULE" ]; then TASK=":$MODULE:assemble$V"; else TASK="assemble$V"; fi
+          if [ -f gradlew ]; then chmod +x gradlew; GR=./gradlew; else GR=gradle; fi
+          echo "Running: $GR $TASK"
+          $GR "$TASK" --no-daemon --stacktrace
+
+      - name: Collect and sign APK
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cd "$ROOT"
+          FOUND=$(find . -path '*/build/outputs/apk/*' -name '*.apk' | grep -v androidTest || true)
+          if [ -z "$FOUND" ]; then
+            echo "No APK was produced."
+            exit 1
+          fi
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n1)
+          keytool -genkeypair -keystore "$HOME/ci.jks" -storepass android -keypass android -alias ci -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=CI Build"
+          echo "$FOUND" | while read -r f; do
+            base=$(basename "$f" .apk)
+            case "$base" in
+              *unsigned*)
+                "$BT/zipalign" -f -p 4 "$f" "/tmp/$base-aligned.apk"
+                "$BT/apksigner" sign --ks "$HOME/ci.jks" --ks-pass pass:android --key-pass pass:android --out "$GITHUB_WORKSPACE/out/${base/unsigned/signed}.apk" "/tmp/$base-aligned.apk"
+                ;;
+              *)
+                cp "$f" "$GITHUB_WORKSPACE/out/$(echo "$f" | sed 's|^\./||; s|/build/outputs/apk/|_|; s|/|_|g')"
+                ;;
+            esac
+          done
+          ls -la "$GITHUB_WORKSPACE/out"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.tag }}
+          path: out/*.apk
+          retention-days: 7
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" out/*.apk --title "$TAG" --notes "Built by APK cloud builder" --target "$GITHUB_SHA"
