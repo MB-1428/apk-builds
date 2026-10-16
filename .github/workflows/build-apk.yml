@@ -58,6 +58,11 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: |
+            platform-tools
+            platforms;android-35
+            build-tools;35.0.0
 
       - name: Unpack project
         run: |
@@ -81,14 +86,14 @@ jobs:
           sdkmanager "ndk;$NDK_VER"
 
       - name: Build with Gradle
-        run: |
-          set -e
-          cd "$ROOT"
-          V="$(echo "${VARIANT:0:1}" | tr '[:lower:]' '[:upper:]')${VARIANT:1}"
-          if [ -n "$MODULE" ]; then TASK=":$MODULE:assemble$V"; else TASK="assemble$V"; fi
-          if [ -f gradlew ]; then chmod +x gradlew; GR=./gradlew; else GR=gradle; fi
-          echo "Running: $GR $TASK"
-          $GR "$TASK" --no-daemon --stacktrace
+        uses: gradle/gradle-build-action@v3
+        with:
+          gradle-version: '8.9'
+          build-root-directory: ${{ env.ROOT }}
+          arguments: |
+            ${{ env.MODULE != '' && format(':{0}:', env.MODULE) || '' }}assemble${{ inputs.variant == 'release' && 'Release' || 'Debug' }} --no-daemon --stacktrace
+        env:
+          GRADLE_USER_HOME: ${{ runner.temp }}/.gradle
 
       - name: Collect and sign APK
         run: |
